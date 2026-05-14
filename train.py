@@ -23,6 +23,21 @@ from dataset import BraTSSegDataset
 from model import UNet
 
 
+def _hf_upload(local_path: str, repo_id: str, path_in_repo: str, token: str):
+    try:
+        from huggingface_hub import HfApi
+        HfApi().upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            token=token,
+        )
+        print(f"  [HF] uploaded → {repo_id}/{path_in_repo}")
+    except Exception as e:
+        print(f"  [HF] upload failed: {e}")
+
+
 # ── Loss ─────────────────────────────────────────────────────────────────────
 class DiceBCELoss(nn.Module):
     def __init__(self, smooth: float = 1.0):
@@ -75,6 +90,10 @@ def parse_args():
     p.add_argument("--save_every", type=int,   default=5,
                    help="Save a numbered checkpoint every N epochs (0 = disabled)")
     p.add_argument("--resume",     default="")
+    p.add_argument("--hf_repo",    default="",
+                   help="HuggingFace repo id to upload checkpoints, e.g. minh2004pd/unet-brats")
+    p.add_argument("--hf_token",   default=os.environ.get("HF_TOKEN", ""),
+                   help="HF write token (or set HF_TOKEN env var)")
     return p.parse_args()
 
 
@@ -177,14 +196,25 @@ def main():
             "best_dice": best_dice,
             "args": vars(args),
         }
-        torch.save(ckpt, os.path.join(args.output_dir, "checkpoint_last.pth"))
+        last_path = os.path.join(args.output_dir, "checkpoint_last.pth")
+        torch.save(ckpt, last_path)
+        if args.hf_repo and args.hf_token:
+            _hf_upload(last_path, args.hf_repo, "checkpoint_last.pth", args.hf_token)
+
         if val_dice == val_dice and val_dice > best_dice:  # not nan
             best_dice = val_dice
             ckpt["best_dice"] = best_dice
-            torch.save(ckpt, os.path.join(args.output_dir, "checkpoint_best.pth"))
+            best_path = os.path.join(args.output_dir, "checkpoint_best.pth")
+            torch.save(ckpt, best_path)
             print(f"  ↑ New best val_dice={best_dice:.4f}")
+            if args.hf_repo and args.hf_token:
+                _hf_upload(best_path, args.hf_repo, "checkpoint_best.pth", args.hf_token)
+
         if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            torch.save(ckpt, os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1:03d}.pth"))
+            epoch_path = os.path.join(args.output_dir, f"checkpoint_epoch{epoch+1:03d}.pth")
+            torch.save(ckpt, epoch_path)
+            if args.hf_repo and args.hf_token:
+                _hf_upload(epoch_path, args.hf_repo, f"checkpoint_epoch{epoch+1:03d}.pth", args.hf_token)
 
     csv_f.close()
     print(f"\nTraining done. Best val_dice={best_dice:.4f}")
