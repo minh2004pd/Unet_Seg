@@ -90,8 +90,8 @@ def parse_args():
     p.add_argument("--save_every", type=int,   default=5,
                    help="Save a numbered checkpoint every N epochs (0 = disabled)")
     p.add_argument("--resume",     default="")
-    p.add_argument("--hf_repo",    default="",
-                   help="HuggingFace repo id to upload checkpoints, e.g. minh2004pd/unet-brats")
+    p.add_argument("--hf_repo",    default=os.environ.get("HF_REPO", "minh2k4/unet-brats"),
+                   help="HuggingFace repo id to upload checkpoints")
     p.add_argument("--hf_token",   default=os.environ.get("HF_TOKEN", ""),
                    help="HF write token (or set HF_TOKEN env var)")
     return p.parse_args()
