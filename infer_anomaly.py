@@ -147,22 +147,35 @@ def main():
                 print(f"  {idx+1}/{len(ds)}")
 
     # ── Pooled threshold sweep ────────────────────────────────────────────────
+    print("Running pooled threshold sweep...")
     all_probs_flat = np.concatenate(all_probs)
     all_gt_flat    = np.concatenate(all_gt)
+
     thresholds = np.linspace(0, 1, args.threshold_steps + 1)
     best_dice, best_thr = 0.0, 0.5
     for thr in thresholds:
-        pred = (all_probs_flat > thr).astype(np.float32)
-        d = dice_score(pred, all_gt_flat)
+        pred_bool = all_probs_flat > thr          # bool, 8× less RAM than float32
+        inter = (pred_bool & all_gt_flat.astype(bool)).sum()
+        denom = pred_bool.sum() + all_gt_flat.sum()
+        d = (2 * inter + 1e-6) / (denom + 1e-6)
         if d > best_dice:
-            best_dice, best_thr = d, thr
+            best_dice, best_thr = d, float(thr)
+
+    # Sample 2M pixels for AUROC/AP (full 263M is too slow)
+    N_SAMPLE = 2_000_000
+    rng = np.random.default_rng(42)
+    if len(all_probs_flat) > N_SAMPLE:
+        idx_s = rng.choice(len(all_probs_flat), N_SAMPLE, replace=False)
+        p_s, g_s = all_probs_flat[idx_s], all_gt_flat[idx_s]
+    else:
+        p_s, g_s = all_probs_flat, all_gt_flat
 
     try:
-        ap = average_precision_score(all_gt_flat, all_probs_flat)
+        ap = average_precision_score(g_s, p_s)
     except Exception:
         ap = float("nan")
     try:
-        auroc_pool = roc_auc_score(all_gt_flat, all_probs_flat)
+        auroc_pool = roc_auc_score(g_s, p_s)
     except Exception:
         auroc_pool = float("nan")
 
