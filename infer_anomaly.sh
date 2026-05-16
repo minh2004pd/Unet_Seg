@@ -1,8 +1,8 @@
 #!/bin/bash
 set -a && source .env 2>/dev/null; set +a
 
-DATA_ROOT="${DATA_ROOT:-/mnt/apple/k66/minhdd/data/brats2021}"
-SPLIT_FILE="${SPLIT_FILE:-$DATA_ROOT/preprocessed_split_old_val251.json}"
+DATA_ROOT="${DATA_ROOT:-/workspace/data/brats2021}"
+SPLIT_FILE="${SPLIT_FILE:-/workspace/preprocessed_split_train_val_test.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-./anomaly_results_unet}"
 SPLIT="${SPLIT:-test}"
 CKPT_DIR="${CKPT_DIR:-./output_unet}"
@@ -10,7 +10,8 @@ CHECKPOINT="${CHECKPOINT:-$(ls -t "$CKPT_DIR"/checkpoint_best.pth 2>/dev/null | 
 BASE_CH="${BASE_CH:-64}"
 THRESHOLD="${THRESHOLD:-0.5}"
 THRESHOLD_STEPS="${THRESHOLD_STEPS:-200}"
-SAVE_PNG="${SAVE_PNG:-0}"
+NO_SAVE_PNG="${NO_SAVE_PNG:-0}"
+MAX_SAVE="${MAX_SAVE:--1}"
 
 if [ -z "$CHECKPOINT" ]; then
     echo "ERROR: no checkpoint found. Set CHECKPOINT= or train first."
@@ -21,8 +22,11 @@ echo "Checkpoint: $CHECKPOINT"
 echo "Split:      $SPLIT"
 echo "Output:     $OUTPUT_DIR"
 
+mkdir -p "$OUTPUT_DIR"
+
 EXTRA=()
-[ "$SAVE_PNG" -eq 1 ] && EXTRA+=(--save_png)
+[ "$NO_SAVE_PNG" -eq 1 ] && EXTRA+=(--no_save_png)
+EXTRA+=(--max_save "$MAX_SAVE")
 
 python infer_anomaly.py \
     --checkpoint      "$CHECKPOINT" \

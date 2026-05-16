@@ -5,13 +5,13 @@ Pipeline:
     * Forward each unhealthy slice through the trained UNet → binary mask.
     * Metrics: DICE, IoU, AUROC per slice; pooled best-DICE threshold sweep.
     * Healthy slices: just report they have no tumor (no metrics needed).
-    * Output: metrics.csv, summary.txt, optional PNG per sample.
+    * Output: metrics.csv, summary.txt, PNG grids per sample (input + output).
 
 Usage:
     python infer_anomaly.py \
         --checkpoint ./output_unet/checkpoint_best.pth \
-        --data_root  /mnt/apple/k66/minhdd/data/brats2021 \
-        --split_file /mnt/apple/k66/minhdd/data/brats2021/preprocessed_split.json \
+        --data_root  /workspace/data/brats2021 \
+        --split_file /workspace/preprocessed_split_train_val_test.json \
         --output_dir ./anomaly_results_unet \
         --split      test
 """
@@ -23,24 +23,28 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from dataset import BraTSSegDataset
 from model import UNet
 
+MODALITY_NAMES = ["T1", "T1CE", "T2", "FLAIR"]
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint",  required=True)
-    p.add_argument("--data_root",   default="/mnt/apple/k66/minhdd/data/brats2021")
-    p.add_argument("--split_file",  default="/mnt/apple/k66/minhdd/data/brats2021/preprocessed_split_old_val251.json")
+    p.add_argument("--data_root",   default="/workspace/data/brats2021")
+    p.add_argument("--split_file",  default="/workspace/preprocessed_split_train_val_test.json")
     p.add_argument("--output_dir",  default="./anomaly_results_unet")
     p.add_argument("--split",       default="test")
     p.add_argument("--base_ch",     type=int,   default=64)
     p.add_argument("--threshold",   type=float, default=0.5)
     p.add_argument("--threshold_steps", type=int, default=200)
-    p.add_argument("--save_png",    action="store_true")
+    p.add_argument("--no_save_png", action="store_true", help="disable PNG output")
+    p.add_argument("--max_save",    type=int, default=-1,
+                   help="max PNG grids to save (-1 = all)")
     p.add_argument("--device",      default="cuda")
     return p.parse_args()
 
@@ -56,29 +60,80 @@ def iou_score(pred, gt, smooth=1e-6):
     return (inter + smooth) / (union + smooth)
 
 
-def save_png(arr_01, path):
-    img = (arr_01 * 255).clip(0, 255).astype(np.uint8)
-    Image.fromarray(img).save(path)
+def to_uint8(arr):
+    return (arr * 255).clip(0, 255).astype(np.uint8)
+
+
+def save_grid(img_4ch, prob, pred_bin, gt, slice_path, metrics, out_path):
+    """Save a single-row grid: [T1 | T1CE | T2 | FLAIR | prob_map | pred_mask | gt_mask].
+    Each tile is 256×256. A header row shows the slice path and metrics.
+    """
+    H, W = 256, 256
+    HEADER = 20
+    n_tiles = 7
+    canvas = Image.new("RGB", (W * n_tiles, H + HEADER), color=(20, 20, 20))
+
+    tiles = [
+        Image.fromarray(to_uint8(img_4ch[c])).convert("RGB")
+        for c in range(4)
+    ]
+    # prob map: grayscale → green tint
+    prob_gray = to_uint8(prob)
+    prob_rgb  = np.stack([np.zeros_like(prob_gray), prob_gray, np.zeros_like(prob_gray)], axis=-1)
+    tiles.append(Image.fromarray(prob_rgb.astype(np.uint8)))
+    # pred mask: white on black
+    tiles.append(Image.fromarray(to_uint8(pred_bin)).convert("RGB"))
+    # gt mask: red on black
+    gt_u8  = to_uint8(gt)
+    gt_rgb = np.stack([gt_u8, np.zeros_like(gt_u8), np.zeros_like(gt_u8)], axis=-1)
+    tiles.append(Image.fromarray(gt_rgb.astype(np.uint8)))
+
+    for i, tile in enumerate(tiles):
+        canvas.paste(tile.resize((W, H), Image.NEAREST), (i * W, HEADER))
+
+    # Header text
+    draw = ImageDraw.Draw(canvas)
+    label_names = MODALITY_NAMES + ["prob", "pred", "GT"]
+    for i, name in enumerate(label_names):
+        draw.text((i * W + 2, 2), name, fill=(200, 200, 200))
+
+    d, iou, auroc = metrics
+    header_txt = (
+        f"{slice_path}   "
+        f"DICE={d:.3f}  IoU={iou:.3f}  AUROC={auroc:.3f}"
+    )
+    draw.text((0, 10), header_txt, fill=(255, 220, 50))
+
+    canvas.save(str(out_path))
 
 
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+    save_png = not args.no_save_png
+    if save_png:
+        png_dir = Path(args.output_dir) / "images"
+        png_dir.mkdir(exist_ok=True)
+
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # Load model
     model = UNet(in_channels=4, base_ch=args.base_ch).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
     print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')+1}")
 
     ds = BraTSSegDataset(args.data_root, args.split_file, split=args.split)
     print(f"Evaluating {len(ds)} unhealthy slices from '{args.split}' split")
+    if save_png:
+        n_saved = len(ds) if args.max_save < 0 else args.max_save
+        print(f"Saving PNG grids for up to {n_saved} slices → {png_dir}")
 
     all_probs = []
     all_gt    = []
     rows = []
+    saved = 0
 
     with torch.no_grad():
         for idx in range(len(ds)):
@@ -91,22 +146,25 @@ def main():
 
             pred_bin = (prob > args.threshold).astype(np.float32)
             d = dice_score(pred_bin, gt)
-            i = iou_score(pred_bin, gt)
+            iou = iou_score(pred_bin, gt)
 
             try:
                 auroc = roc_auc_score(gt.ravel().astype(int), prob.ravel())
             except ValueError:
                 auroc = float("nan")
 
-            rows.append({"idx": idx, "dice": d, "iou": i, "auroc": auroc})
+            slice_path = ds.samples[idx]["path"]
+            rows.append({"idx": idx, "slice": slice_path,
+                          "dice": d, "iou": iou, "auroc": auroc})
 
-            if args.save_png and idx < 200:
-                out = Path(args.output_dir) / f"sample_{idx:04d}"
-                out.mkdir(exist_ok=True)
-                save_png(img[0].numpy(), str(out / "T1.png"))
-                save_png(prob,            str(out / "prob_map.png"))
-                save_png(pred_bin,        str(out / "pred_mask.png"))
-                save_png(gt,              str(out / "gt_mask.png"))
+            if save_png and (args.max_save < 0 or saved < args.max_save):
+                grid_path = png_dir / f"{idx:05d}.png"
+                save_grid(
+                    img.numpy(), prob, pred_bin, gt,
+                    slice_path, (d, iou, auroc),
+                    grid_path,
+                )
+                saved += 1
 
             if (idx + 1) % 500 == 0:
                 print(f"  {idx+1}/{len(ds)}")
@@ -134,7 +192,7 @@ def main():
     # ── Write CSV ─────────────────────────────────────────────────────────────
     csv_path = os.path.join(args.output_dir, "metrics.csv")
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["idx", "dice", "iou", "auroc"])
+        w = csv.DictWriter(f, fieldnames=["idx", "slice", "dice", "iou", "auroc"])
         w.writeheader()
         for r in rows:
             w.writerow({k: f"{v:.6f}" if isinstance(v, float) else v for k, v in r.items()})
