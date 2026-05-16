@@ -4,8 +4,20 @@ UNet segmentation inference on BraTS 2021 test set.
 Pipeline:
     * Forward each unhealthy slice through the trained UNet → binary mask.
     * Metrics: DICE, IoU, AUROC per slice; pooled best-DICE threshold sweep.
-    * Healthy slices: just report they have no tumor (no metrics needed).
-    * Output: metrics.csv, summary.txt, PNG grids per sample (input + output).
+    * Output: metrics.csv, summary.txt, per-slice folders with individual PNGs.
+
+Output layout (images/):
+    images/
+        00000/          <- index of the slice
+            T1.png
+            T1CE.png
+            T2.png
+            FLAIR.png
+            prob_map.png
+            pred_mask.png
+            gt_mask.png
+        00001/
+            ...
 
 Usage:
     python infer_anomaly.py \
@@ -23,7 +35,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from dataset import BraTSSegDataset
@@ -44,7 +56,7 @@ def parse_args():
     p.add_argument("--threshold_steps", type=int, default=200)
     p.add_argument("--no_save_png", action="store_true", help="disable PNG output")
     p.add_argument("--max_save",    type=int, default=-1,
-                   help="max PNG grids to save (-1 = all)")
+                   help="max slice folders to save (-1 = all)")
     p.add_argument("--device",      default="cuda")
     return p.parse_args()
 
@@ -64,47 +76,14 @@ def to_uint8(arr):
     return (arr * 255).clip(0, 255).astype(np.uint8)
 
 
-def save_grid(img_4ch, prob, pred_bin, gt, slice_path, metrics, out_path):
-    """Save a single-row grid: [T1 | T1CE | T2 | FLAIR | prob_map | pred_mask | gt_mask].
-    Each tile is 256×256. A header row shows the slice path and metrics.
-    """
-    H, W = 256, 256
-    HEADER = 20
-    n_tiles = 7
-    canvas = Image.new("RGB", (W * n_tiles, H + HEADER), color=(20, 20, 20))
-
-    tiles = [
-        Image.fromarray(to_uint8(img_4ch[c])).convert("RGB")
-        for c in range(4)
-    ]
-    # prob map: grayscale → green tint
-    prob_gray = to_uint8(prob)
-    prob_rgb  = np.stack([np.zeros_like(prob_gray), prob_gray, np.zeros_like(prob_gray)], axis=-1)
-    tiles.append(Image.fromarray(prob_rgb.astype(np.uint8)))
-    # pred mask: white on black
-    tiles.append(Image.fromarray(to_uint8(pred_bin)).convert("RGB"))
-    # gt mask: red on black
-    gt_u8  = to_uint8(gt)
-    gt_rgb = np.stack([gt_u8, np.zeros_like(gt_u8), np.zeros_like(gt_u8)], axis=-1)
-    tiles.append(Image.fromarray(gt_rgb.astype(np.uint8)))
-
-    for i, tile in enumerate(tiles):
-        canvas.paste(tile.resize((W, H), Image.NEAREST), (i * W, HEADER))
-
-    # Header text
-    draw = ImageDraw.Draw(canvas)
-    label_names = MODALITY_NAMES + ["prob", "pred", "GT"]
-    for i, name in enumerate(label_names):
-        draw.text((i * W + 2, 2), name, fill=(200, 200, 200))
-
-    d, iou, auroc = metrics
-    header_txt = (
-        f"{slice_path}   "
-        f"DICE={d:.3f}  IoU={iou:.3f}  AUROC={auroc:.3f}"
-    )
-    draw.text((0, 10), header_txt, fill=(255, 220, 50))
-
-    canvas.save(str(out_path))
+def save_slice_images(img_4ch, prob, pred_bin, gt, out_dir):
+    """Save individual PNGs for one slice into out_dir."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for c, name in enumerate(MODALITY_NAMES):
+        Image.fromarray(to_uint8(img_4ch[c])).save(str(out_dir / f"{name}.png"))
+    Image.fromarray(to_uint8(prob)).save(str(out_dir / "prob_map.png"))
+    Image.fromarray(to_uint8(pred_bin)).save(str(out_dir / "pred_mask.png"))
+    Image.fromarray(to_uint8(gt)).save(str(out_dir / "gt_mask.png"))
 
 
 def main():
@@ -112,8 +91,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     save_png = not args.no_save_png
     if save_png:
-        png_dir = Path(args.output_dir) / "images"
-        png_dir.mkdir(exist_ok=True)
+        png_root = Path(args.output_dir) / "images"
+        png_root.mkdir(exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -128,7 +107,7 @@ def main():
     print(f"Evaluating {len(ds)} unhealthy slices from '{args.split}' split")
     if save_png:
         n_saved = len(ds) if args.max_save < 0 else args.max_save
-        print(f"Saving PNG grids for up to {n_saved} slices → {png_dir}")
+        print(f"Saving per-slice images for up to {n_saved} slices → {png_root}")
 
     all_probs = []
     all_gt    = []
@@ -145,7 +124,7 @@ def main():
             all_gt.append(gt.ravel().astype(np.uint8))
 
             pred_bin = (prob > args.threshold).astype(np.float32)
-            d = dice_score(pred_bin, gt)
+            d   = dice_score(pred_bin, gt)
             iou = iou_score(pred_bin, gt)
 
             try:
@@ -158,11 +137,9 @@ def main():
                           "dice": d, "iou": iou, "auroc": auroc})
 
             if save_png and (args.max_save < 0 or saved < args.max_save):
-                grid_path = png_dir / f"{idx:05d}.png"
-                save_grid(
+                save_slice_images(
                     img.numpy(), prob, pred_bin, gt,
-                    slice_path, (d, iou, auroc),
-                    grid_path,
+                    png_root / f"{idx:05d}",
                 )
                 saved += 1
 
